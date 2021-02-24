@@ -1,8 +1,7 @@
-# 数据库访问工具类
 import functools
 import logging
 
-log = logging.getLogger('db2ls')
+log = logging.getLogger('dbtool')
 
 
 class DB:
@@ -14,8 +13,8 @@ class DB:
         self.conn_close = conn_close
         self.cursor_type = cursor_type
 
-    # 打开一个连接
     def connection(self):
+        """open a connection."""
         if self.conn:
             return self.conn
         conn = self.datasource.connection()
@@ -23,171 +22,175 @@ class DB:
             conn.cursor = functools.partial(conn.cursor, self.cursor_type)
         return conn
 
-    # 关闭指定连接
     def close_connection(self, conn):
+        """close a connection."""
         if conn and self.conn_close:
             conn.close()
 
-    # 执行查询sql, 返回单行数据.
-    def query_one(self, sql, args=()):
-        cursor = self.query_cursor(sql, args)
-        conn = cursor.connection
+    def execute(self, sql, args=(), fetchone=False, return_cursor=False, executemany=False, executescript=False):
+        """execute sql, like select, insert, update statement."""
+        conn, cursor = self.connection(), None
         try:
-            return cursor.fetchone()
-        finally:
-            cursor.close()
-            self.close_connection(conn)
-
-    # 执行查询sql, 返回所有数据.
-    def query_all(self, sql, args=()):
-        cursor = self.query_cursor(sql, args)
-        conn = cursor.connection
-        try:
-            return cursor.fetchall()
-        finally:
-            cursor.close()
-            self.close_connection(conn)
-
-    # 执行统计sql, 返回查询条数.
-    def query_count(self, sql, args=()):
-        count_sql = f"select count(*) from ({sql}) t"
-        return self.query_one(count_sql, args)[0]
-
-    # 执行统计sql, 返回游标.
-    def query_cursor(self, sql, args=()):
-        conn = self.connection()
-        cursor = None
-        try:
-            cursor = conn.cursor()
             log.debug('sql=[ %s ], args=[ %s ]', sql, args)
-            cursor.execute(sql, tuple(args))
-            conn.commit()
-            return cursor
-        except Exception as e:
-            if cursor:
-                cursor.close()
-            self.close_connection(conn)
-            raise e
-
-    # 执行sql
-    def execute(self, sql, args=()):
-        conn = self.connection()
-        cursor = None
-        try:
             cursor = conn.cursor()
-            log.debug('sql=[ %s ], args=[ %s ]', sql, args)
-            cursor.execute(sql, tuple(args))
-            conn.commit()
-            if sql.upper().startswith('INSERT INTO'):
+            if executescript:
+                if cursor.executescript:
+                    cursor.executescript(sql)
+                else:
+                    cursor.execute(sql, tuple(args))
+            elif executemany:
+                cursor.executemany(sql, tuple(args))
+            else:
+                cursor.execute(sql, tuple(args))
+            sql_type = DB.__extract_sql_type(sql)
+            is_select = not executemany and sql_type == 'SELECT'
+            is_insert = not executemany and sql_type == 'INSERT'
+            if is_select:
+                conn.commit()
+            # returns
+            if fetchone:
+                return cursor.fetchone()
+            elif return_cursor:
+                return_cursor = True
+                return cursor
+            elif is_select:
+                return cursor.fetchall()
+            elif is_insert:
                 return cursor.lastrowid
             else:
                 return cursor.rowcount
         finally:
-            if cursor:
+            if cursor and not return_cursor:
                 cursor.close()
             self.close_connection(conn)
 
-    # 批量执行sql
-    def executemany(self, sql, args=()):
-        conn = self.connection()
-        cursor = None
-        try:
-            cursor = conn.cursor()
-            log.debug('sql=[ %s ], args=[ %s ]', sql, args)
-            cursor.executemany(sql, tuple(args))
-            conn.commit()
-            return cursor.rowcount
-        finally:
-            if cursor:
-                cursor.close()
-            self.close_connection(conn)
+    @staticmethod
+    def __extract_sql_type(sql):
+        sql_upper = sql.lstrip().upper()
+        if sql_upper.startswith('SELECT'):
+            return 'SELECT'
+        elif sql_upper.startswith('INSERT'):
+            return 'INSERT'
+        elif sql_upper.startswith('DELETE'):
+            return 'DELETE'
+        elif sql_upper.startswith('UPDATE'):
+            return 'UPDATE'
 
-    # 执行sql脚本, 脚本中多条以符号;分割
-    def executescript(self, sql_script):
-        conn = self.connection()
-        cursor = None
-        try:
-            cursor = conn.cursor()
-            log.debug('sql=[ %s ]', sql_script)
-            cursor.executescript(sql_script)
-            conn.commit()
-        finally:
-            if cursor:
-                cursor.close()
-            self.close_connection(conn)
+    def execute_fetchone(self, sql, args=()):
+        """execute sql, returns one row."""
+        return self.execute(sql, args, fetchone=True)
 
-    # 执行sql脚本文件
-    def executescript_file(self, file):
-        with open(file, 'r', encoding='utf-8') as f:
-            script = f.read()
-        return self.executescript(script)
+    def execute_count(self, sql, args=()):
+        """ execute sql, returns rows counts."""
+        count_sql = f"SELECT count(*) total FROM ({sql}) t"
+        row = self.execute_fetchone(count_sql, args)
+        if type(row) == list or type(row) == tuple:
+            return row[0]
+        else:
+            return row['total']
 
-    # 插入单条数据
+    def execute_cursor(self, sql, args=()):
+        """execute sql, returns cursor."""
+        return self.execute(sql, args, return_cursor=True)
+
+    def execute_many(self, sql, args=()):
+        """execute sql, like insert, update statement with many args."""
+        return self.execute(sql, args, executemany=True)
+
+    def execute_script(self, sql):
+        """execute multiples sql, split with semicolon."""
+        return self.execute(sql, executescript=True)
+
+    def execute_file(self, file, encoding='utf-8'):
+        """execute sql file."""
+        with open(file, 'r', encoding=encoding) as f:
+            sql = f.read()
+            return self.execute_script(sql)
+
     def insert(self, data, table=None):
+        """ insert one row.
+        :param data: the data of row
+        :param table: the db table name
+        :return: returns autogenerate id
+        """
         k_snippet = ', '.join(data.keys())
         v_snippet = ', '.join([self.replacer] * len(data.keys()))
-        sql = f'insert into {table}({k_snippet}) values({v_snippet})'
+        sql = f'INSERT INTO {table}({k_snippet}) VALUES({v_snippet})'
         values = data.values()
         return self.execute(sql, values)
 
-    # 删除单条数据，依据主键.
-    def delete_by_id(self, id_val, table=None, id_name='id'):
-        sql = f'delete from {table} where {id_name} = {self.replacer}'
-        values = (id_val,)
-        return self.execute(sql, values)
-
-    # 修改单条数据.
     def update(self, data, table=None, id_name='id'):
-        d = self.__filter_dict(data, excludes=(id_name,))
+        """ update one row.
+        :param data: the data
+        :param table: the db table name
+        :param id_name: the primary column name
+        :return: returns effective rows counts
+        """
+        d = DB.__filter_dict(data, excludes=(id_name,))
         id_value = data[id_name]
 
         set_snippet = ', '.join(list(map(lambda k: k + '=' + self.replacer, d.keys())))
-        sql = f'update {table} set {set_snippet} where id = ?'
+        sql = f'UPDATE {table} SET {set_snippet} WHERE {id_name} = ?'
         values = (*d.values(), id_value)
         return self.execute(sql, values)
 
-    # 修改数据, 以累加方式
     def increment(self, data, table=None, id_name='id'):
-        d = self.__filter_dict(data, excludes=(id_name,))
+        """ update rows for increment.
+        :param data: the data
+        :param table: the db table name
+        :param id_name: the primary column name
+        :return: returns effective rows counts.
+        """
+        d = DB.__filter_dict(data, excludes=(id_name,))
         id_value = data[id_name]
 
         set_snippet = ', '.join(list(map(lambda k: k + '=' + k + '+' + self.replacer, d.keys())))
-        sql = f'update {table} set {set_snippet} where id = ?'
+        sql = f'UPDATE {table} SET {set_snippet} WHERE {id_name} = ?'
         values = (*d.values(), id_value)
         return self.execute(sql, values)
 
-    # 统计数据条数.
-    def count(self, data, table=None):
-        where_snippet = ''
-        if data:
-            where_snippet = 'where ' + ', '.join(list(map(lambda k: k + '=' + self.replacer, data.keys())))
-        sql = f'select count(*) from {table} {where_snippet}'
-        values = data.values()
-        return self.query_count(sql, values)
-
-    # 查询单条数据, 根据主键.
-    def find_by_id(self, id_val, table=None, id_name='id'):
-        sql = f'select * {table} where {id_name} = {self.replacer}'
+    def delete_by_id(self, id_val, table=None, id_name='id'):
+        """delete rows by id."""
+        sql = f'DELETE FROM {table} where {id_name} = {self.replacer}'
         values = (id_val,)
-        return self.query_one(sql, values)
+        return self.execute(sql, values)
 
-    # 查询所有数据
+    def find_by_id(self, id_val, table=None, id_name='id'):
+        """find one row by id"""
+        sql = f'SELECT * FROM {table} WHERE {id_name} = {self.replacer}'
+        values = (id_val,)
+        return self.execute_fetchone(sql, values)
+
     def find(self, table, **keys):
-        where = ' and '.join(list(map(lambda k: k + '=' + self.replacer, keys.keys())))
-        if where:
-            where = "where " + where
-        sql = f'select * from {table} {where}'
-        return self.query_all(sql, keys.values())
+        """find rows by query."""
+        where = self.__build_where_snippet(keys)
+        sql = f'SELECT * FROM {table} {where}'
+        return self.execute(sql, keys.values())
 
-    # 查询单条数据
+    def __build_where_snippet(self, keys):
+        snippet = ' AND '.join(list(map(lambda k: k + '=' + self.replacer, keys.keys())))
+        if snippet:
+            snippet = 'WHERE ' + snippet
+        return snippet
+
     def find_one(self, table, **keys):
-        where = ' and '.join(list(map(lambda k: k + '=' + self.replacer, keys.keys())))
-        if where:
-            where = "where " + where
-        sql = f'select * from {table} {where}'
-        return self.query_one(sql, keys.values())
+        """find one row by query."""
+        where = self.__build_where_snippet(keys)
+        sql = f'SELECT * FROM {table} {where}'
+        return self.execute_fetchone(sql, keys.values())
 
-    def __filter_dict(self, data, includes=(), excludes=()):
+    def find_count(self, table, **keys):
+        """count rows by query."""
+        where = self.__build_where_snippet(keys)
+        sql = f'SELECT count(*) total FROM {table} {where}'
+        row = self.execute_fetchone(sql, keys.values())
+        if type(row) == list or type(row) == tuple:
+            return row[0]
+        else:
+            return row['total']
+
+    @staticmethod
+    def __filter_dict(data, includes=(), excludes=()):
         if includes:
             return {k: v for k, v in data.items() if k in includes}
         elif excludes:
