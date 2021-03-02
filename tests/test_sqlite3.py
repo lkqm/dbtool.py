@@ -33,6 +33,11 @@ class TestDB(unittest.TestCase):
         count = db.execute_count('select * from test_user')
         self.assertEqual(count, 2)
 
+    def test_execute_cursor(self):
+        cursor = db.execute_cursor('select * from test_user')
+        db.close_cursor(cursor)
+        db.execute('select * from test_user')
+
     def test_execute(self):
         row_id = db.execute("insert into test_user(name, age) values(?, ?)", ('Mou', 18))
         self.assertEqual(row_id, 3, 'insert row must be return last autogenerate id')
@@ -42,15 +47,6 @@ class TestDB(unittest.TestCase):
     def test_execute_many(self):
         rows = db.execute_many("insert into test_user(name, age) values(?, ?)", [('LK', 18), ('QM', 17)])
         self.assertEqual(rows, 2, 'batch insert must be return effects rows')
-
-    def test_execute_script(self):
-        db.execute_script("""
-            create table test(
-                id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT    NOT NULL
-            );
-            drop table test;
-        """)
 
     def test_insert(self):
         row_id = db.insert({'name': 'M', 'age': 18}, table='test_user')
@@ -90,3 +86,74 @@ class TestDB(unittest.TestCase):
     def test_find_count(self):
         count = db.find_count('test_user', id=1)
         self.assertEqual(count, 1)
+
+    def test_transactional(self):
+        # case rollback
+        try:
+            with db.transaction():
+                db.execute("INSERT INTO test_user(id, name, age) values(3, 'Q', 100)")
+                row = db.execute_fetchone("select * from test_user where id = 3")
+                self.assertIsNotNone(row, 'row is not None in same transactional.')
+                raise Exception()
+        except:
+            ...
+        finally:
+            row = db.execute_fetchone("select * from test_user where id = 3")
+            self.assertIsNone(row, 'row should rollback of id = 3')
+        # case commit
+        with db.transaction():
+            db.execute("INSERT INTO test_user(id, name, age) values(3, 'Q', 100)")
+            row = db.execute_fetchone("select * from test_user where id = 3")
+            self.assertIsNotNone(row, 'row is not None in same transactional.')
+
+    def test_transactional_nesting(self):
+        # case rollback
+        try:
+            with db.transaction():
+                with db.transaction():
+                    db.execute("INSERT INTO test_user(id, name, age) values(3, 'Q', 100)")
+                    row = db.execute_fetchone("select * from test_user where id = 3")
+                    self.assertIsNotNone(row, 'row is not None in same transactional.')
+                raise Exception
+        except:
+            ...
+        finally:
+            row = db.execute_fetchone("select * from test_user where id = 3")
+            self.assertIsNone(row, 'row should rollback of id = 3')
+        # case commit
+        with db.transaction():
+            with db.transaction():
+                db.execute("INSERT INTO test_user(id, name, age) values(3, 'Q', 100)")
+                row = db.execute_fetchone("select * from test_user where id = 3")
+                self.assertIsNotNone(row, 'row is not None in same transactional.')
+            row = db.execute_fetchone("select * from test_user where id = 3")
+            self.assertIsNotNone(row, 'row is not None in same transactional.')
+        row = db.execute_fetchone("select * from test_user where id = 3")
+        self.assertIsNotNone(row, 'row is not None in same transactional.')
+
+    def test_transactional_decorator(self):
+        # case rollback
+        try:
+            self.execute_exception()
+        except:
+            ...
+        finally:
+            row = db.execute_fetchone("select * from test_user where id = 3")
+            self.assertIsNone(row, 'row should rollback of id = 3')
+        # case commit
+        self.execute_normal()
+        row = db.execute_fetchone("select * from test_user where id = 3")
+        self.assertIsNotNone(row, 'row is not None in same transactional.')
+
+    @db.transaction
+    def execute_normal(self):
+        db.execute("INSERT INTO test_user(id, name, age) values(3, 'Q', 100)")
+        row = db.execute_fetchone("select * from test_user where id = 3")
+        self.assertIsNotNone(row, 'row is not None in same transactional.')
+
+    @db.transaction
+    def execute_exception(self):
+        db.execute("INSERT INTO test_user(id, name, age) values(3, 'Q', 100)")
+        row = db.execute_fetchone("select * from test_user where id = 3")
+        self.assertIsNotNone(row, 'row is not None in same transactional.')
+        raise Exception()

@@ -10,79 +10,84 @@ log = logging.getLogger('dbtool')
 
 class DB:
 
-    def __init__(self, dbtype, dt_row=None, **keys):
+    def __init__(self, dbtype, dt_row=None, dt_handle_replacer=True, **keys):
         """ Init DB.
         :param dbtype: supports dbtype like sqlite, mysql,...
+        :param dt_handle_replacer: handle sql replacer
         :param keys: dbutils.pooled_db.PooledDB args, driver engine args
         """
-        creator, replacer, row_factory = self.__resolve_dbtype(dbtype, dt_row)
-        self.datasource = PooledDB(creator, **keys)
-        self.dbtype = dbtype
-        self.replacer = replacer
-        self.row_factory = row_factory
+        creator, replacer, row_factory, handle_replacer = self._resolve_dbtype(dbtype, dt_row, dt_handle_replacer)
+        self._datasource = PooledDB(creator, **keys)
+        self._dbtype = dbtype
+        self._handle_replacer = dt_handle_replacer
+        self._replacer = replacer
+        self._row_factory = row_factory
         self.__transaction_ctx = _TransactionCtx()
 
     @staticmethod
-    def __resolve_dbtype(dbtype, row_factory):
+    def _resolve_dbtype(dbtype, row_factory, handle_replacer):
         if dbtype == 'sqlite':
-            creator = importlib.import_module('sqlite3')
+            import sqlite3
+            creator = sqlite3
             replacer = '?'
-            row_factory = _default(row_factory, dict_factory)
-            creator.connect = functools.partial(_sqlite3_connect, connect=creator.connect, row_factory=row_factory)
+            handle_replacer = False
+            row_factory = row_factory or DB.__dict_factory
+            creator.connect = functools.partial(DB.__sqlite3_connect, connect=creator.connect, row_factory=row_factory)
         elif dbtype == 'mysql':
-            creator = importlib.import_module('pymysql')
+            import pymysql
+            creator = pymysql
             replacer = '%s'
-            row_factory = _default(row_factory, creator.cursors.DictCursor)
+            row_factory = row_factory or creator.cursors.DictCursor
         elif dbtype == 'postgresql':
-            creator = importlib.import_module('psycopg2')
+            import psycopg2
+            creator = psycopg2
             replacer = '%s'
             psycopg2_extras = importlib.import_module('psycopg2.extras')
-            row_factory = _default(row_factory, psycopg2_extras.RealDictCursor)
+            row_factory = row_factory or psycopg2_extras.RealDictCursor
         elif dbtype == 'sqlserver':
-            creator = importlib.import_module('pymssql')
-            row_factory = _default(row_factory, True)
+            import pymssql
+            creator = pymssql
+            row_factory = row_factory or True
             replacer = '%s'
         else:
             raise BaseException('unknown db type')
-        return creator, replacer, row_factory
+        return creator, replacer, row_factory, handle_replacer
 
     def __connection(self):
         """open a connection."""
         if self.__transaction_ctx.conn:
             return self.__transaction_ctx.conn
-        conn = self.datasource.connection()
-        if self.row_factory:
-            if self.dbtype == 'mysql':
-                conn.cursor = functools.partial(conn.cursor, self.row_factory)
-            elif self.dbtype == 'postgresql':
-                conn.cursor = functools.partial(conn.cursor, cursor_factory=self.row_factory)
-            elif self.dbtype == 'sqlserver':
+        conn = self._datasource.connection()
+        if self._row_factory:
+            if self._dbtype == 'mysql':
+                conn.cursor = functools.partial(conn.cursor, self._row_factory)
+            elif self._dbtype == 'postgresql':
+                conn.cursor = functools.partial(conn.cursor, cursor_factory=self._row_factory)
+            elif self._dbtype == 'sqlserver':
                 conn.cursor = functools.partial(conn.cursor, as_dict=True)
         self.__transaction_ctx.init_conn_maybe(conn)
         return conn
 
-    @staticmethod
-    def __close_connection(conn):
-        """close a connection."""
-        if conn and not conn._transaction:
-            conn.close()
-
     def transaction(self, func=None):
         if func is None:
             return self.__transaction_ctx
+
         def wrapper(*args, **kw):
             with self.__transaction_ctx:
                 return func(*args, **kw)
+
         return wrapper
 
     def execute(self, sql, args=(), fetchone=False, return_cursor=False, executemany=False, executescript=False):
         """execute sql, like select, insert, update, delete, ... statement."""
         conn, cursor = self.__connection(), None
+        if self._handle_replacer:
+            sql = self.__handle_replacer(sql)
         try:
             log.debug('sql=[ %s ], args=[ %s ]', sql, args)
             cursor = conn.cursor()
             if executescript:
-                if self.dbtype == 'sqlite':
+                if self._dbtype == 'sqlite':
                     cursor.executescript(sql)
                 else:
                     cursor.execute(sql, tuple(args))
@@ -99,6 +104,7 @@ class DB:
             if fetchone:
                 return cursor.fetchone()
             elif return_cursor:
+                cursor._dbutils_connection = conn
                 return_cursor = True
                 return cursor
             elif is_select:
@@ -110,7 +116,8 @@ class DB:
         finally:
             if cursor and not return_cursor:
                 cursor.close()
-            self.__close_connection(conn)
+            if not return_cursor:
+                self.__close_connection(conn)
 
     def execute_fetchone(self, sql, args=()):
         """execute sql, returns one row."""
@@ -143,6 +150,54 @@ class DB:
             sql = f.read()
             return self.execute_script(sql)
 
+    def close_cursor(self, cursor):
+        cursor.close()
+        if cursor._dbutils_connection:
+            self.__close_connection(cursor._dbutils_connection)
+
+    def __handle_replacer(self, sql):
+        """Replace sql replacer ? with driver replacer character."""
+        chars = []
+        for c in sql:
+            if c != '?':
+                chars.append(c)
+            else:
+                chars.append(self._replacer)
+        return ''.join(chars)
+
+    @staticmethod
+    def __close_connection(conn):
+        """close a connection."""
+        if conn and not conn._transaction:
+            conn.close()
+
+    @staticmethod
+    def __extract_sql_type(sql):
+        sql_upper = sql.lstrip().upper()
+        if sql_upper.startswith('SELECT'):
+            return 'SELECT'
+        elif sql_upper.startswith('INSERT'):
+            return 'INSERT'
+        elif sql_upper.startswith('DELETE'):
+            return 'DELETE'
+        elif sql_upper.startswith('UPDATE'):
+            return 'UPDATE'
+
+    def __dict_factory(cursor, row):
+        """a row factory to dict."""
+        d = {}
+        for idx, col in enumerate(cursor.description):
+            d[col[0]] = row[idx]
+        return d
+
+    def __sqlite3_connect(connect=None, row_factory=None, **keys):
+        """wrap sqlite3 connect method for set row_factory"""
+        conn = connect(**keys)
+        conn.row_factory = row_factory
+        return conn
+
+    # ------------------ CRUD ------------------#
+
     def insert(self, data, table=None):
         """ insert one row.
         :param data: the data of row
@@ -150,7 +205,7 @@ class DB:
         :return: returns autogenerate id
         """
         k_snippet = ', '.join(data.keys())
-        v_snippet = ', '.join([self.replacer] * len(data.keys()))
+        v_snippet = ', '.join([self._replacer] * len(data.keys()))
         sql = f'INSERT INTO {table}({k_snippet}) VALUES({v_snippet})'
         values = data.values()
         return self.execute(sql, values)
@@ -165,8 +220,8 @@ class DB:
         d = DB.__filter_dict(data, excludes=(id_name,))
         id_value = data[id_name]
 
-        set_snippet = ', '.join(list(map(lambda k: k + '=' + self.replacer, d.keys())))
-        sql = f'UPDATE {table} SET {set_snippet} WHERE {id_name} = {self.replacer}'
+        set_snippet = ', '.join(list(map(lambda k: k + '=' + self._replacer, d.keys())))
+        sql = f'UPDATE {table} SET {set_snippet} WHERE {id_name} = {self._replacer}'
         values = (*d.values(), id_value)
         return self.execute(sql, values)
 
@@ -180,20 +235,20 @@ class DB:
         d = DB.__filter_dict(data, excludes=(id_name,))
         id_value = data[id_name]
 
-        set_snippet = ', '.join(list(map(lambda k: k + '=' + k + '+' + self.replacer, d.keys())))
-        sql = f'UPDATE {table} SET {set_snippet} WHERE {id_name} = {self.replacer}'
+        set_snippet = ', '.join(list(map(lambda k: k + '=' + k + '+' + self._replacer, d.keys())))
+        sql = f'UPDATE {table} SET {set_snippet} WHERE {id_name} = {self._replacer}'
         values = (*d.values(), id_value)
         return self.execute(sql, values)
 
     def delete_by_id(self, id_val, table=None, id_name='id'):
         """delete rows by id."""
-        sql = f'DELETE FROM {table} where {id_name} = {self.replacer}'
+        sql = f'DELETE FROM {table} where {id_name} = {self._replacer}'
         values = (id_val,)
         return self.execute(sql, values)
 
     def find_by_id(self, id_val, table=None, id_name='id'):
         """find one row by id"""
-        sql = f'SELECT * FROM {table} WHERE {id_name} = {self.replacer}'
+        sql = f'SELECT * FROM {table} WHERE {id_name} = {self._replacer}'
         values = (id_val,)
         return self.execute_fetchone(sql, values)
 
@@ -204,7 +259,7 @@ class DB:
         return self.execute(sql, keys.values())
 
     def __build_where_snippet(self, keys):
-        snippet = ' AND '.join(list(map(lambda k: k + '=' + self.replacer, keys.keys())))
+        snippet = ' AND '.join(list(map(lambda k: k + '=' + self._replacer, keys.keys())))
         if snippet:
             snippet = 'WHERE ' + snippet
         return snippet
@@ -226,18 +281,6 @@ class DB:
             return row['total']
 
     @staticmethod
-    def __extract_sql_type(sql):
-        sql_upper = sql.lstrip().upper()
-        if sql_upper.startswith('SELECT'):
-            return 'SELECT'
-        elif sql_upper.startswith('INSERT'):
-            return 'INSERT'
-        elif sql_upper.startswith('DELETE'):
-            return 'DELETE'
-        elif sql_upper.startswith('UPDATE'):
-            return 'UPDATE'
-
-    @staticmethod
     def __filter_dict(data, includes=(), excludes=()):
         if includes:
             return {k: v for k, v in data.items() if k in includes}
@@ -245,28 +288,6 @@ class DB:
             return {k: v for k, v in data.items() if k not in excludes}
         else:
             return dict(data)
-
-
-def dict_factory(cursor, row):
-    """a row factory to dict."""
-    d = {}
-    for idx, col in enumerate(cursor.description):
-        d[col[0]] = row[idx]
-    return d
-
-
-def _sqlite3_connect(connect=None, row_factory=None, **keys):
-    """wrap sqlite3 connect method for set row_factory"""
-    conn = connect(**keys)
-    conn.row_factory = row_factory
-    return conn
-
-
-def _default(val, def_val):
-    """return def_val if val is None"""
-    if val is not None:
-        return val
-    return def_val
 
 
 class _TransactionCtx(threading.local):

@@ -13,7 +13,7 @@ db = dbtool.DB('sqlite', database=':memory:')
 db.execute(sql)
 db.execute_fetchone(sql)
 db.execute_count(sql)
-db.execute_cursort(sql)
+db.execute_cursor(sql)
 db.execute_many(sql)
 db.execute_script(sql)
 db.execute_file(file)
@@ -30,6 +30,17 @@ db.find_count('user', type=0)
 # transactions
 with db.transaction():
     db.execute(sql1)
+
+# example mysql
+db_config = {
+    'host': '127.0.0.1',
+    'port': 3306,
+    'database': 'test',
+    'user': 'root',
+    'password': '123456',
+    'client_flag': CLIENT.MULTI_STATEMENTS,
+}
+db = dbtool.DB('mysql',  mincached=1, maxconnections=20, **db_config)
 ```
 
 db vs driver
@@ -38,3 +49,5 @@ db vs driver
 - mysql - pymysql
 - postgresql - psycopg2
 - sqlserver - pymssql
+
+connections pool args: https://webwareforpython.github.io/DBUtils/main.html#pooleddb-pooled-db
