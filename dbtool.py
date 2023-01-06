@@ -2,6 +2,7 @@ import functools
 import importlib
 import logging
 import threading
+from urllib.parse import urlparse
 
 from dbutils.pooled_db import PooledDB
 
@@ -10,22 +11,32 @@ log = logging.getLogger('dbtool')
 
 class DB:
 
-    def __init__(self, dbtype, dt_row=None, dt_handle_replacer=True, **keys):
+    def __init__(self, url, dt_row=None, dt_handle_replacer=True, mincached=0, maxconnections=0, blocking=False, ):
         """ Init DB.
-        :param dbtype: supports dbtype like sqlite, mysql,...
         :param dt_handle_replacer: handle sql replacer
-        :param keys: dbutils.pooled_db.PooledDB args, driver engine args
+        :param mincached: initial number of idle connections in the pool
+            (0 means no connections are made at startup)
+        :param maxconnections: maximum number of connections generally allowed
+            (0 or None means an arbitrary number of connections)
+        :param blocking: determines behavior when exceeding the maximum
+            (if this is set to true, block and wait until the number of
+            connections decreases, otherwise an error will be reported)
         """
-        creator, replacer, row_factory, handle_replacer = self._resolve_dbtype(dbtype, dt_row, dt_handle_replacer)
-        self._datasource = PooledDB(creator, **keys)
-        self._dbtype = dbtype
+        database_url = _DatabaseUrl(url)
+        creator, replacer, row_factory, handle_replacer, kwargs = self._resolve_dbtype(database_url, dt_row,
+                                                                                       dt_handle_replacer)
+        self._datasource = PooledDB(creator, mincached=mincached, maxconnections=maxconnections, blocking=blocking,
+                                    **kwargs)
+        self._dbtype = database_url.scheme
         self._handle_replacer = dt_handle_replacer
         self._replacer = replacer
         self._row_factory = row_factory
         self.__transaction_ctx = _TransactionCtx()
 
     @staticmethod
-    def _resolve_dbtype(dbtype, row_factory, handle_replacer):
+    def _resolve_dbtype(database_url, row_factory, handle_replacer):
+        dbtype = database_url.scheme
+        connect_parameters = database_url.params
         if dbtype == 'sqlite':
             import sqlite3
             creator = sqlite3
@@ -33,25 +44,41 @@ class DB:
             handle_replacer = False
             row_factory = row_factory or DB.__dict_factory
             creator.connect = functools.partial(DB.__sqlite3_connect, connect=creator.connect, row_factory=row_factory)
+            connect_parameters['database'] = database_url.database
         elif dbtype == 'mysql':
             import pymysql
             creator = pymysql
             replacer = '%s'
             row_factory = row_factory or creator.cursors.DictCursor
+            connect_parameters['host'] = database_url.host
+            connect_parameters['port'] = database_url.port
+            connect_parameters['user'] = database_url.username
+            connect_parameters['password'] = database_url.password
+            connect_parameters['database'] = database_url.database
         elif dbtype == 'postgresql':
             import psycopg2
             creator = psycopg2
             replacer = '%s'
             psycopg2_extras = importlib.import_module('psycopg2.extras')
             row_factory = row_factory or psycopg2_extras.RealDictCursor
+            connect_parameters['host'] = database_url.host
+            connect_parameters['port'] = database_url.port
+            connect_parameters['user'] = database_url.username
+            connect_parameters['password'] = database_url.password
+            connect_parameters['dbname'] = database_url.database
         elif dbtype == 'sqlserver':
             import pymssql
             creator = pymssql
             row_factory = row_factory or True
             replacer = '%s'
+            connect_parameters['host'] = database_url.host
+            connect_parameters['port'] = database_url.port
+            connect_parameters['user'] = database_url.username
+            connect_parameters['password'] = database_url.password
+            connect_parameters['database'] = database_url.database
         else:
-            raise BaseException('unknown db type')
-        return creator, replacer, row_factory, handle_replacer
+            raise Exception('unknown supports dms:' + dbtype)
+        return creator, replacer, row_factory, handle_replacer, connect_parameters
 
     def __connection(self):
         """open a connection."""
@@ -78,38 +105,41 @@ class DB:
 
         return wrapper
 
-    def execute(self, sql, args=(), fetchone=False, return_cursor=False, executemany=False, executescript=False):
+    def execute(self, sql, args=()):
         """execute sql, like select, insert, update, delete, ... statement."""
+        return self._execute(sql, args)
+
+    def _execute(self, sql, args=(), fetchone=False, return_cursor=False, batch=False, script=False):
+        log.debug('execute sql=[ %s ], args=[ %s ]', sql, args)
         conn, cursor = self.__connection(), None
         if self._handle_replacer:
             sql = self.__handle_replacer(sql)
         try:
-            log.debug('sql=[ %s ], args=[ %s ]', sql, args)
             cursor = conn.cursor()
-            if executescript:
-                if self._dbtype == 'sqlite':
-                    cursor.executescript(sql)
-                else:
-                    cursor.execute(sql, tuple(args))
-            elif executemany:
+            if script and self._dbtype == 'sqlite':
+                cursor.executescript(sql)
+            elif batch:
                 cursor.executemany(sql, tuple(args))
             else:
                 cursor.execute(sql, tuple(args))
+
             sql_type = DB.__extract_sql_type(sql)
-            is_select = not executemany and sql_type == 'SELECT'
-            is_insert = not executemany and sql_type == 'INSERT'
+            is_select = sql_type == 'SELECT'
+            return_row_id = not batch and (sql_type == 'INSERT' or sql_type == 'REPLACE')
             if not is_select and not conn._transaction:
                 conn.commit()
-            # returns
-            if fetchone:
-                return cursor.fetchone()
+
+            if script:
+                return None
             elif return_cursor:
                 cursor._dbutils_connection = conn
                 return_cursor = True
                 return cursor
+            elif fetchone:
+                return cursor.fetchone()
             elif is_select:
                 return cursor.fetchall()
-            elif is_insert:
+            elif return_row_id:
                 return cursor.lastrowid
             else:
                 return cursor.rowcount
@@ -121,34 +151,19 @@ class DB:
 
     def execute_fetchone(self, sql, args=()):
         """execute sql, returns one row."""
-        return self.execute(sql, args, fetchone=True)
-
-    def execute_count(self, sql, args=()):
-        """ execute sql, returns rows counts."""
-        count_sql = f"SELECT count(*) total FROM ({sql}) t"
-        row = self.execute_fetchone(count_sql, args)
-        if type(row) == list or type(row) == tuple:
-            return row[0]
-        else:
-            return row['total']
+        return self._execute(sql, args, fetchone=True)
 
     def execute_cursor(self, sql, args=()):
         """execute sql, returns cursor."""
-        return self.execute(sql, args, return_cursor=True)
+        return self._execute(sql, args, return_cursor=True)
 
-    def execute_many(self, sql, args=()):
+    def execute_batch(self, sql, args=()):
         """execute sql, like insert, update statement with many args."""
-        return self.execute(sql, args, executemany=True)
+        return self._execute(sql, args, batch=True)
 
     def execute_script(self, sql):
         """execute multiples sql, split with semicolon."""
-        return self.execute(sql, executescript=True)
-
-    def execute_file(self, file, encoding='utf-8'):
-        """execute sql file."""
-        with open(file, 'r', encoding=encoding) as f:
-            sql = f.read()
-            return self.execute_script(sql)
+        return self._execute(sql, script=True)
 
     def close_cursor(self, cursor):
         cursor.close()
@@ -178,11 +193,14 @@ class DB:
             return 'SELECT'
         elif sql_upper.startswith('INSERT'):
             return 'INSERT'
+        elif sql_upper.startswith('REPLACE'):
+            return 'REPLACE'
         elif sql_upper.startswith('DELETE'):
             return 'DELETE'
         elif sql_upper.startswith('UPDATE'):
             return 'UPDATE'
 
+    @staticmethod
     def __dict_factory(cursor, row):
         """a row factory to dict."""
         d = {}
@@ -190,6 +208,7 @@ class DB:
             d[col[0]] = row[idx]
         return d
 
+    @staticmethod
     def __sqlite3_connect(connect=None, row_factory=None, **keys):
         """wrap sqlite3 connect method for set row_factory"""
         conn = connect(**keys)
@@ -198,65 +217,44 @@ class DB:
 
     # ------------------ CRUD ------------------#
 
-    def insert(self, data, table=None):
+    def insert(self, table, data):
         """ insert one row.
-        :param data: the data of row
         :param table: the db table name
+        :param data: the data of row
         :return: returns autogenerate id
         """
         k_snippet = ', '.join(data.keys())
         v_snippet = ', '.join([self._replacer] * len(data.keys()))
         sql = f'INSERT INTO {table}({k_snippet}) VALUES({v_snippet})'
         values = data.values()
-        return self.execute(sql, values)
+        return self._execute(sql, values)
 
-    def update(self, data, table=None, id_name='id'):
+    def update(self, table, data, id_column='id'):
         """ update one row.
-        :param data: the data
         :param table: the db table name
-        :param id_name: the primary column name
+        :param data: the data
+        :param id_column: the primary column name
         :return: returns effective rows counts
         """
-        d = DB.__filter_dict(data, excludes=(id_name,))
-        id_value = data[id_name]
+        d = DB.__filter_dict(data, excludes=(id_column,))
+        id_value = data[id_column]
 
         set_snippet = ', '.join(list(map(lambda k: k + '=' + self._replacer, d.keys())))
-        sql = f'UPDATE {table} SET {set_snippet} WHERE {id_name} = {self._replacer}'
+        sql = f'UPDATE {table} SET {set_snippet} WHERE {id_column} = {self._replacer}'
         values = (*d.values(), id_value)
-        return self.execute(sql, values)
+        return self._execute(sql, values)
 
-    def increment(self, data, table=None, id_name='id'):
-        """ update rows for increment.
-        :param data: the data
-        :param table: the db table name
-        :param id_name: the primary column name
-        :return: returns effective rows counts.
-        """
-        d = DB.__filter_dict(data, excludes=(id_name,))
-        id_value = data[id_name]
-
-        set_snippet = ', '.join(list(map(lambda k: k + '=' + k + '+' + self._replacer, d.keys())))
-        sql = f'UPDATE {table} SET {set_snippet} WHERE {id_name} = {self._replacer}'
-        values = (*d.values(), id_value)
-        return self.execute(sql, values)
-
-    def delete_by_id(self, id_val, table=None, id_name='id'):
+    def delete(self, table, **keys):
         """delete rows by id."""
-        sql = f'DELETE FROM {table} where {id_name} = {self._replacer}'
-        values = (id_val,)
-        return self.execute(sql, values)
-
-    def find_by_id(self, id_val, table=None, id_name='id'):
-        """find one row by id"""
-        sql = f'SELECT * FROM {table} WHERE {id_name} = {self._replacer}'
-        values = (id_val,)
-        return self.execute_fetchone(sql, values)
+        where = self.__build_where_snippet(keys)
+        sql = f'DELETE FROM {table} {where}'
+        return self._execute(sql, keys.values())
 
     def find(self, table, **keys):
         """find rows by query."""
         where = self.__build_where_snippet(keys)
         sql = f'SELECT * FROM {table} {where}'
-        return self.execute(sql, keys.values())
+        return self._execute(sql, keys.values())
 
     def __build_where_snippet(self, keys):
         snippet = ' AND '.join(list(map(lambda k: k + '=' + self._replacer, keys.keys())))
@@ -319,3 +317,24 @@ class _TransactionCtx(threading.local):
         if self.need_transaction and self.conn is None:
             self.conn = conn
             self.conn.begin()
+
+
+class _DatabaseUrl:
+    def __init__(self, url):
+        info = urlparse(url)
+        self.scheme = info.scheme
+        self.host = info.hostname
+        self.database = info.path[1:] if len(info.path) > 0 else None
+        self.username = info.username
+        self.password = info.password
+        self.port = info.port
+        self.params = self._parse_query(info.query)
+
+    @staticmethod
+    def _parse_query(query):
+        data = [split.split('=', maxsplit=2) for split in query.split("&")]
+        params = {}
+        for one in data:
+            if len(one[0]):
+                params[one[0]] = one[1] if len(one) > 1 else None
+        return params

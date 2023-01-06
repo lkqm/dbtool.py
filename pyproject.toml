@@ -1,0 +1,21 @@
+[tool.poetry]
+name = 'dbtool'
+version = '0.1.0'
+authors = ['Mario Luo <luokaiqiongmou@foxmail.com>']
+description = 'A lightweight db tools for sql.'
+readme = 'README.md'
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[tool.poetry.urls]
+"Homepage" = 'https://github.com/lkqm/dbtool.py'
+"Bug Tracker" = "https://github.com/lkqm/dbtool.py/issues"
+
+[tool.poetry.dependencies]
+python = "^3.6"
+dbutils = '*'
+
+

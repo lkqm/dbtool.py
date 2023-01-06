@@ -1,18 +1,8 @@
 import unittest
 
-from pymysql.constants import CLIENT
-
 import dbtool
 
-db_config = {
-    'host': '127.0.0.1',
-    'port': 3306,
-    'database': 'test',
-    'user': 'root',
-    'password': '123456',
-    'client_flag': CLIENT.MULTI_STATEMENTS,
-}
-db = dbtool.DB('mysql', **db_config)
+db = dbtool.DB('mysql://root:123456@127.0.0.1:3306/test?client_flag=65536')
 
 
 class TestDB(unittest.TestCase):
@@ -37,12 +27,6 @@ class TestDB(unittest.TestCase):
         users = db.execute('select * from test_user')
         self.assertEqual(len(users), 2, "数据条数2条")
 
-    def test_execute_count(self):
-        count = db.execute_count('select * from test_user where id = -1')
-        self.assertEqual(count, 0)
-        count = db.execute_count('select * from test_user')
-        self.assertEqual(count, 2)
-
     def test_execute_cursor(self):
         cursor = db.execute_cursor('select * from test_user')
         db.close_cursor(cursor)
@@ -54,31 +38,27 @@ class TestDB(unittest.TestCase):
         rows = db.execute("update test_user set age = ? where id = ?", (10, row_id))
         self.assertEqual(rows, 1, 'update rows must be return effects rows')
 
-    def test_execute_many(self):
-        rows = db.execute_many("insert into test_user(name, age) values(?, ?)", [('LK', 18), ('QM', 17)])
+    def test_execute_batch(self):
+        rows = db.execute_batch("insert into test_user(name, age) values(?, ?)", [('LK', 18), ('QM', 17)])
         self.assertEqual(rows, 2, 'batch insert must be return effects rows')
 
     def test_insert(self):
-        row_id = db.insert({'name': 'M', 'age': 18}, table='test_user')
+        row_id = db.insert('test_user', {'name': 'M', 'age': 18})
         self.assertEqual(row_id, 3, 'insert row must be return last autogenerate id')
 
     def test_update(self):
-        rows = db.update({'id': 1, 'age': 10}, table='test_user')
+        rows = db.update('test_user', {'id': 1, 'age': 10})
         self.assertEqual(rows, 1)
         user = db.find_one('test_user', id=1)
         self.assertEqual(user['id'], 1)
         self.assertEqual(user['name'], 'Mario')
         self.assertEqual(user['age'], 10)
 
-    def test_delete_by_id(self):
-        rows = db.delete_by_id(2, table='test_user')
+    def test_delete(self):
+        rows = db.delete('test_user', id=2)
         self.assertEqual(rows, 1, 'delete rows should be 1.')
-        user = db.find_by_id(2, table='test_user')
+        user = db.find_one('test_user', id=2)
         self.assertIsNone(user, 'user id=2 should be deleted.')
-
-    def test_find_by_id(self):
-        user = db.find_by_id(1, table='test_user')
-        self.assertIsNotNone(user, 'user id=1 should exists.')
 
     def test_find(self):
         rows = db.find('test_user')
