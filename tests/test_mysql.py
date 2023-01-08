@@ -1,8 +1,10 @@
 import unittest
 
+from pymysql.constants import CLIENT
+
 import dbtool
 
-db = dbtool.DB('mysql://root:123456@127.0.0.1:3306/test?client_flag=65536')
+db = dbtool.connect('mysql://root:123456@127.0.0.1:3306/test', client_flag=CLIENT.MULTI_STATEMENTS)
 
 
 class TestDB(unittest.TestCase):

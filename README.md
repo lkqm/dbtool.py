@@ -7,8 +7,8 @@ pip install dbtool
 
 ```
 # sqlite3 ....
-db = dbtool.DB('sqlite:///:memory:')
-db = dbtool.DB('mysql://root:123456@127.0.0.1:3306/test?client_flag=65536',  mincached=1, maxconnections=20)
+db = dbtool.connect('sqlite:///:memory:')
+db = dbtool.connect('mysql://root:123456@127.0.0.1:3306/test',  mincached=1, maxconnections=20)
 
 # sql
 db.execute(sql)

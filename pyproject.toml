@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 [tool.poetry]
 name = 'dbtool'
-version = '0.1.0'
+version = '0.1.1'
 authors = ['Mario Luo <luokaiqiongmou@foxmail.com>']
 description = 'A lightweight db tools for sql.'
 readme = 'README.md'
@@ -18,4 +19,7 @@ classifiers = [
 python = "^3.6"
 dbutils = '*'
 
+
+[tool.poetry.group.dev.dependencies]
+pymysql = "^1.0.2"
 

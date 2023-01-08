@@ -2,7 +2,7 @@ import unittest
 
 import dbtool
 
-db = dbtool.DB('sqlite:///:memory:', mincached=1)
+db = dbtool.connect('sqlite:///:memory:', mincached=1)
 
 
 class TestDB(unittest.TestCase):

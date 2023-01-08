@@ -1,19 +1,17 @@
 import functools
 import importlib
-import logging
 import threading
 from urllib.parse import urlparse
 
 from dbutils.pooled_db import PooledDB
 
-log = logging.getLogger('dbtool')
-
 
 class DB:
 
-    def __init__(self, url, dt_row=None, dt_handle_replacer=True, mincached=0, maxconnections=0, blocking=False, ):
+    def __init__(self, url, row_factory=None, handle_placeholder=True, mincached=0, maxconnections=0, blocking=False,
+                 **options):
         """ Init DB.
-        :param dt_handle_replacer: handle sql replacer
+        :param handle_placeholder: handle sql placeholder
         :param mincached: initial number of idle connections in the pool
             (0 means no connections are made at startup)
         :param maxconnections: maximum number of connections generally allowed
@@ -21,64 +19,56 @@ class DB:
         :param blocking: determines behavior when exceeding the maximum
             (if this is set to true, block and wait until the number of
             connections decreases, otherwise an error will be reported)
+        :param options: dbms driver connect parameter, see sqlite3, pymysql, ...
         """
         database_url = _DatabaseUrl(url)
-        creator, replacer, row_factory, handle_replacer, kwargs = self._resolve_dbtype(database_url, dt_row,
-                                                                                       dt_handle_replacer)
+        creator, placeholder, row_factory, handle_placeholder, kwargs = self._resolve_dbms(database_url, row_factory,
+                                                                                           handle_placeholder, options)
         self._datasource = PooledDB(creator, mincached=mincached, maxconnections=maxconnections, blocking=blocking,
                                     **kwargs)
-        self._dbtype = database_url.scheme
-        self._handle_replacer = dt_handle_replacer
-        self._replacer = replacer
+        self._dbms = database_url.dbms
+        self._handle_placeholder = handle_placeholder
+        self._placeholder = placeholder
         self._row_factory = row_factory
         self.__transaction_ctx = _TransactionCtx()
 
     @staticmethod
-    def _resolve_dbtype(database_url, row_factory, handle_replacer):
-        dbtype = database_url.scheme
-        connect_parameters = database_url.params
-        if dbtype == 'sqlite':
+    def _resolve_dbms(database_url, row_factory, handle_placeholder, options):
+        dbms = database_url.dbms
+        connect_parameters = options.copy()
+        connect_parameters['host'] = database_url.host
+        connect_parameters['port'] = database_url.port
+        connect_parameters['user'] = database_url.username
+        connect_parameters['password'] = database_url.password
+        connect_parameters['database'] = database_url.database
+        if dbms == 'sqlite':
             import sqlite3
             creator = sqlite3
-            replacer = '?'
-            handle_replacer = False
+            placeholder = '?'
+            handle_placeholder = False
             row_factory = row_factory or DB.__dict_factory
             creator.connect = functools.partial(DB.__sqlite3_connect, connect=creator.connect, row_factory=row_factory)
-            connect_parameters['database'] = database_url.database
-        elif dbtype == 'mysql':
+            for key in ['host', 'port', 'user', 'password']:
+                del connect_parameters[key]
+        elif dbms == 'mysql':
             import pymysql
             creator = pymysql
-            replacer = '%s'
+            placeholder = '%s'
             row_factory = row_factory or creator.cursors.DictCursor
-            connect_parameters['host'] = database_url.host
-            connect_parameters['port'] = database_url.port
-            connect_parameters['user'] = database_url.username
-            connect_parameters['password'] = database_url.password
-            connect_parameters['database'] = database_url.database
-        elif dbtype == 'postgresql':
+        elif dbms == 'postgresql':
             import psycopg2
             creator = psycopg2
-            replacer = '%s'
+            placeholder = '%s'
             psycopg2_extras = importlib.import_module('psycopg2.extras')
             row_factory = row_factory or psycopg2_extras.RealDictCursor
-            connect_parameters['host'] = database_url.host
-            connect_parameters['port'] = database_url.port
-            connect_parameters['user'] = database_url.username
-            connect_parameters['password'] = database_url.password
-            connect_parameters['dbname'] = database_url.database
-        elif dbtype == 'sqlserver':
+        elif dbms == 'sqlserver':
             import pymssql
             creator = pymssql
             row_factory = row_factory or True
-            replacer = '%s'
-            connect_parameters['host'] = database_url.host
-            connect_parameters['port'] = database_url.port
-            connect_parameters['user'] = database_url.username
-            connect_parameters['password'] = database_url.password
-            connect_parameters['database'] = database_url.database
+            placeholder = '%s'
         else:
-            raise Exception('unknown supports dms:' + dbtype)
-        return creator, replacer, row_factory, handle_replacer, connect_parameters
+            raise Exception('unsupported dbms:' + dbms)
+        return creator, placeholder, row_factory, handle_placeholder, connect_parameters
 
     def __connection(self):
         """open a connection."""
@@ -86,11 +76,11 @@ class DB:
             return self.__transaction_ctx.conn
         conn = self._datasource.connection()
         if self._row_factory:
-            if self._dbtype == 'mysql':
+            if self._dbms == 'mysql':
                 conn.cursor = functools.partial(conn.cursor, self._row_factory)
-            elif self._dbtype == 'postgresql':
+            elif self._dbms == 'postgresql':
                 conn.cursor = functools.partial(conn.cursor, cursor_factory=self._row_factory)
-            elif self._dbtype == 'sqlserver':
+            elif self._dbms == 'sqlserver':
                 conn.cursor = functools.partial(conn.cursor, as_dict=True)
         self.__transaction_ctx.init_conn_maybe(conn)
         return conn
@@ -110,23 +100,18 @@ class DB:
         return self._execute(sql, args)
 
     def _execute(self, sql, args=(), fetchone=False, return_cursor=False, batch=False, script=False):
-        log.debug('execute sql=[ %s ], args=[ %s ]', sql, args)
+        sql = self.__handle_replacer(sql) if self._handle_placeholder else sql
         conn, cursor = self.__connection(), None
-        if self._handle_replacer:
-            sql = self.__handle_replacer(sql)
         try:
             cursor = conn.cursor()
-            if script and self._dbtype == 'sqlite':
+            if script and self._dbms == 'sqlite':
                 cursor.executescript(sql)
             elif batch:
                 cursor.executemany(sql, tuple(args))
             else:
                 cursor.execute(sql, tuple(args))
-
-            sql_type = DB.__extract_sql_type(sql)
-            is_select = sql_type == 'SELECT'
-            return_row_id = not batch and (sql_type == 'INSERT' or sql_type == 'REPLACE')
-            if not is_select and not conn._transaction:
+            statement = _SqlStatement(sql)
+            if not statement.is_select and not conn._transaction:
                 conn.commit()
 
             if script:
@@ -137,9 +122,9 @@ class DB:
                 return cursor
             elif fetchone:
                 return cursor.fetchone()
-            elif is_select:
+            elif statement.is_select:
                 return cursor.fetchall()
-            elif return_row_id:
+            elif not batch and statement.is_lastrowid:
                 return cursor.lastrowid
             else:
                 return cursor.rowcount
@@ -177,7 +162,7 @@ class DB:
             if c != '?':
                 chars.append(c)
             else:
-                chars.append(self._replacer)
+                chars.append(self._placeholder)
         return ''.join(chars)
 
     @staticmethod
@@ -185,20 +170,6 @@ class DB:
         """close a connection."""
         if conn and not conn._transaction:
             conn.close()
-
-    @staticmethod
-    def __extract_sql_type(sql):
-        sql_upper = sql.lstrip().upper()
-        if sql_upper.startswith('SELECT'):
-            return 'SELECT'
-        elif sql_upper.startswith('INSERT'):
-            return 'INSERT'
-        elif sql_upper.startswith('REPLACE'):
-            return 'REPLACE'
-        elif sql_upper.startswith('DELETE'):
-            return 'DELETE'
-        elif sql_upper.startswith('UPDATE'):
-            return 'UPDATE'
 
     @staticmethod
     def __dict_factory(cursor, row):
@@ -224,7 +195,7 @@ class DB:
         :return: returns autogenerate id
         """
         k_snippet = ', '.join(data.keys())
-        v_snippet = ', '.join([self._replacer] * len(data.keys()))
+        v_snippet = ', '.join([self._placeholder] * len(data.keys()))
         sql = f'INSERT INTO {table}({k_snippet}) VALUES({v_snippet})'
         values = data.values()
         return self._execute(sql, values)
@@ -239,8 +210,8 @@ class DB:
         d = DB.__filter_dict(data, excludes=(id_column,))
         id_value = data[id_column]
 
-        set_snippet = ', '.join(list(map(lambda k: k + '=' + self._replacer, d.keys())))
-        sql = f'UPDATE {table} SET {set_snippet} WHERE {id_column} = {self._replacer}'
+        set_snippet = ', '.join(list(map(lambda k: k + '=' + self._placeholder, d.keys())))
+        sql = f'UPDATE {table} SET {set_snippet} WHERE {id_column} = {self._placeholder}'
         values = (*d.values(), id_value)
         return self._execute(sql, values)
 
@@ -257,7 +228,7 @@ class DB:
         return self._execute(sql, keys.values())
 
     def __build_where_snippet(self, keys):
-        snippet = ' AND '.join(list(map(lambda k: k + '=' + self._replacer, keys.keys())))
+        snippet = ' AND '.join(list(map(lambda k: k + '=' + self._placeholder, keys.keys())))
         if snippet:
             snippet = 'WHERE ' + snippet
         return snippet
@@ -289,14 +260,15 @@ class DB:
 
 
 class _TransactionCtx(threading.local):
+    """the transaction context"""
 
     def __init__(self):
-        self.need_transaction = False
+        self.transaction = False
         self.conn = None
         self.transactions = 0
 
     def __enter__(self):
-        self.need_transaction = True
+        self.transaction = True
         self.transactions = self.transactions + 1
         return self
 
@@ -314,27 +286,52 @@ class _TransactionCtx(threading.local):
                 self.conn = None
 
     def init_conn_maybe(self, conn):
-        if self.need_transaction and self.conn is None:
+        if self.transaction and self.conn is None:
             self.conn = conn
             self.conn.begin()
 
 
 class _DatabaseUrl:
+    """represent database connect url"""
+
     def __init__(self, url):
         info = urlparse(url)
-        self.scheme = info.scheme
+        self.dbms = info.scheme
         self.host = info.hostname
         self.database = info.path[1:] if len(info.path) > 0 else None
         self.username = info.username
         self.password = info.password
         self.port = info.port
-        self.params = self._parse_query(info.query)
 
-    @staticmethod
-    def _parse_query(query):
-        data = [split.split('=', maxsplit=2) for split in query.split("&")]
-        params = {}
-        for one in data:
-            if len(one[0]):
-                params[one[0]] = one[1] if len(one) > 1 else None
-        return params
+
+class _SqlStatement:
+    """represent sql statement"""
+
+    def __init__(self, sql):
+        self.sql = sql.lstrip()
+        self.type = None
+        self.is_select = self.is_insert = self.is_replace = self.is_delete = self.is_update = self.is_lastrowid = False
+        self.__init_type(self.sql)
+
+    def __init_type(self, sql):
+        sql = sql[:10].upper()
+        if sql.startswith('SELECT'):
+            self.type = 'SELECT'
+            self.is_select = True
+        elif sql.startswith('INSERT'):
+            self.type = 'INSERT'
+            self.is_insert = True
+            self.is_lastrowid = True
+        elif sql.startswith('REPLACE'):
+            self.type = 'REPLACE'
+            self.is_replace = True
+            self.is_lastrowid = True
+        elif sql.startswith('DELETE'):
+            self.type = 'DELETE'
+            self.is_delete = True
+        elif sql.startswith('UPDATE'):
+            self.type = 'UPDATE'
+            self.is_update = True
+
+
+connect = DB
