@@ -1,5 +1,6 @@
 import functools
 import importlib
+import re
 import threading
 from urllib.parse import urlparse
 
@@ -99,8 +100,10 @@ class DB:
         """execute sql, like select, insert, update, delete, ... statement."""
         return self._execute(sql, args)
 
-    def _execute(self, sql, args=(), fetchone=False, return_cursor=False, batch=False, script=False):
-        sql = self.__handle_replacer(sql) if self._handle_placeholder else sql
+    def _execute(self, sql, args=(), fetchone=False, return_cursor=False, batch=False, script=False,
+                 handel_placeholder=None):
+        handel_placeholder = handel_placeholder if handel_placeholder is not None else self._handle_placeholder
+        sql = sql if not handel_placeholder else self.__handle_replacer(sql)
         conn, cursor = self.__connection(), None
         try:
             cursor = conn.cursor()
@@ -180,52 +183,68 @@ class DB:
         return d
 
     @staticmethod
-    def __sqlite3_connect(connect=None, row_factory=None, **keys):
+    def __sqlite3_connect(connect=None, row_factory=None, **kwargs):
         """wrap sqlite3 connect method for set row_factory"""
-        conn = connect(**keys)
+        conn = connect(**kwargs)
         conn.row_factory = row_factory
         return conn
 
     # ------------------ CRUD ------------------#
 
-    def insert(self, table, data):
+    def insert(self, data, table=None):
         """ insert one row.
-        :param table: the db table name
-        :param data: the data of row
         :return: returns autogenerate id
         """
-        k_snippet = ', '.join(data.keys())
-        v_snippet = ', '.join([self._placeholder] * len(data.keys()))
-        sql = f'INSERT INTO {table}({k_snippet}) VALUES({v_snippet})'
-        values = data.values()
-        return self._execute(sql, values)
+        table_name = self.__table_name(type(data), table)
+        data_dict = self.__data2dict(data)
+        k_snippet = ', '.join(data_dict.keys())
+        v_snippet = ', '.join([self._placeholder] * len(data_dict.keys()))
+        sql = f'INSERT INTO {table_name}({k_snippet}) VALUES({v_snippet})'
+        args = data_dict.values()
+        return self._execute(sql, args, handel_placeholder=False)
 
-    def update(self, table, data, id_column='id'):
+    def update(self, data, table=None, id_column='id'):
         """ update one row.
-        :param table: the db table name
-        :param data: the data
+        :param data: the data of row, allow types dict or object instant
+        :param table: the table name or entity class
         :param id_column: the primary column name
         :return: returns effective rows counts
         """
-        d = DB.__filter_dict(data, excludes=(id_column,))
-        id_value = data[id_column]
+        table_name = self.__table_name(type(data), table)
+        data_dict = self.__data2dict(data)
+        d = DB.__filter_dict(data_dict, excludes=(id_column,))
+        id_value = data_dict[id_column]
 
         set_snippet = ', '.join(list(map(lambda k: k + '=' + self._placeholder, d.keys())))
-        sql = f'UPDATE {table} SET {set_snippet} WHERE {id_column} = {self._placeholder}'
-        values = (*d.values(), id_value)
-        return self._execute(sql, values)
+        sql = f'UPDATE {table_name} SET {set_snippet} WHERE {id_column} = {self._placeholder}'
+        args = (*d.values(), id_value)
+        return self._execute(sql, args, handel_placeholder=False)
 
-    def delete(self, table, **keys):
-        """delete rows by id."""
-        where = self.__build_where_snippet(keys)
-        sql = f'DELETE FROM {table} {where}'
-        return self._execute(sql, keys.values())
+    def delete(self, table, filters):
+        """delete rows by id.
+        :param table: the table name or entity class
+        :param filters: the query conditions
+        :return: returns effective rows counts
+        """
+        table_name = self.__table_name(None, table)
+        where = self.__build_where_snippet(filters)
+        sql = f'DELETE FROM {table_name} {where}'
+        args = filters.values()
+        return self._execute(sql, args, handel_placeholder=False)
 
-    def find(self, table, **keys):
-        """find rows by query."""
-        where = self.__build_where_snippet(keys)
-        sql = f'SELECT * FROM {table} {where}'
-        return self._execute(sql, keys.values())
+    def find(self, table, filters={}, return_type=None):
+        """find rows by query.
+        :param table: the table name or entity class
+        :param filters: the query conditions
+        :param return_type: the return rows type
+        """
+        table_name = self.__table_name(None, table)
+        return_type = self.__return_type(table, return_type)
+        where = self.__build_where_snippet(filters)
+        sql = f'SELECT * FROM {table_name} {where}'
+        args = filters.values()
+        rows = self._execute(sql, args, handel_placeholder=False)
+        return rows if return_type is None else [self.__create_object(row, return_type) for row in rows]
 
     def __build_where_snippet(self, keys):
         snippet = ' AND '.join(list(map(lambda k: k + '=' + self._placeholder, keys.keys())))
@@ -233,21 +252,60 @@ class DB:
             snippet = 'WHERE ' + snippet
         return snippet
 
-    def find_one(self, table, **keys):
-        """find one row by query."""
-        where = self.__build_where_snippet(keys)
-        sql = f'SELECT * FROM {table} {where}'
-        return self.execute_fetchone(sql, keys.values())
+    def find_one(self, table, filters, return_type=None):
+        """find one row by query.
+        :param table: the table name or entity class
+        :param filters: the query conditions
+        :param return_type: the return rows type
+        """
+        table_name = self.__table_name(None, table)
+        return_type = self.__return_type(table, return_type)
+        where = self.__build_where_snippet(filters)
+        sql = f'SELECT * FROM {table_name} {where}'
+        args = filters.values()
+        row = self._execute(sql, args, fetchone=True, handel_placeholder=False)
+        return row if return_type is None else self.__create_object(row, return_type)
 
-    def find_count(self, table, **keys):
-        """count rows by query."""
-        where = self.__build_where_snippet(keys)
-        sql = f'SELECT count(*) total FROM {table} {where}'
-        row = self.execute_fetchone(sql, keys.values())
+    def find_count(self, filters={}, table=None):
+        """count rows by query.
+        :param filters: the query conditions
+        :param table: the table name or entity class
+        :returns count result of type int
+        """
+        table_name = self.__table_name(None, table)
+        where = self.__build_where_snippet(filters)
+        sql = f'SELECT count(*) total FROM {table_name} {where}'
+        args = filters.values()
+        row = self._execute(sql, args, fetchone=True, handel_placeholder=False)
         if type(row) == list or type(row) == tuple:
             return row[0]
         else:
             return row['total']
+
+    def __table_name(self, data_type, table):
+        if type(table) is str:
+            return table
+        else:
+            clazz = table if table else data_type
+            # Specific field： TABLE_NAME
+            if clazz is not None:
+                if hasattr(clazz, 'TABLE_NAME'):
+                    val = getattr(clazz, 'TABLE_NAME')
+                    if val:
+                        return val
+            # Class name
+            return self.__camel2snake(clazz.__name__)
+
+    def __return_type(self, table, return_type):
+        if return_type is not None:
+            return return_type if return_type != dict else None
+        elif type(table) != str:
+            return table
+        return None
+
+    def __data2dict(self, data):
+        # TODO
+        return data if type(data) == dict else vars(data)
 
     @staticmethod
     def __filter_dict(data, includes=(), excludes=()):
@@ -257,6 +315,21 @@ class DB:
             return {k: v for k, v in data.items() if k not in excludes}
         else:
             return dict(data)
+
+    @staticmethod
+    def __create_object(row, return_class):
+        if row is None:
+            return None
+        obj = return_class()
+        for item in row.items():
+            setattr(obj, item[0], item[1])
+        return obj
+
+    __camel_pattern = re.compile(r'(?<!^)(?=[A-Z])')
+
+    @staticmethod
+    def __camel2snake(name):
+        return DB.__camel_pattern.sub('_', name).lower()
 
 
 class _TransactionCtx(threading.local):

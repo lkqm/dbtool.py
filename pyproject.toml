@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 [tool.poetry]
 name = 'dbtool'
-version = '0.1.1'
+version = '0.2.0'
 authors = ['Mario Luo <luokaiqiongmou@foxmail.com>']
 description = 'A lightweight db tools for sql.'
 readme = 'README.md'

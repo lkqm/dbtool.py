@@ -43,38 +43,66 @@ class TestDB(unittest.TestCase):
         self.assertEqual(rows, 2, 'batch insert must be return effects rows')
 
     def test_insert(self):
-        row_id = db.insert('test_user', {'name': 'M', 'age': 18})
+        row_id = db.insert({'name': 'M', 'age': 18}, table='test_user')
         self.assertEqual(row_id, 3, 'insert row must be return last autogenerate id')
+        user = User(name="kk", age=18)
+        row_id = db.insert(user)
+        self.assertEqual(row_id, 4, 'insert row must be return last autogenerate id')
 
     def test_update(self):
-        rows = db.update('test_user', {'id': 1, 'age': 10})
+        rows = db.update({'id': 1, 'age': 10}, table='test_user')
         self.assertEqual(rows, 1)
-        user = db.find_one('test_user', id=1)
+        user = db.find_one(User, {'id': 1}, return_type=dict)
         self.assertEqual(user['id'], 1)
         self.assertEqual(user['name'], 'Mario')
         self.assertEqual(user['age'], 10)
+        # 对象修改
+        user = User(id=2, name="kk", age=100)
+        rows = db.update(user)
+        self.assertEqual(rows, 1)
+        user = db.find_one(User, {'id': 2}, return_type=dict)
+        self.assertEqual(user['id'], 2)
+        self.assertEqual(user['name'], 'kk')
+        self.assertEqual(user['age'], 100)
 
     def test_delete(self):
-        rows = db.delete('test_user', id=2)
+        rows = db.delete('test_user', {'id': 1})
         self.assertEqual(rows, 1, 'delete rows should be 1.')
-        user = db.find_one('test_user', id=2)
+        user = db.find_one(User, {'id': 1})
+        self.assertIsNone(user, 'user id=1 should be deleted.')
+        # obj
+        rows = db.delete(User, {'id': 2})
+        self.assertEqual(rows, 1, 'delete rows should be 1.')
+        user = db.find_one(User, {'id': 2})
         self.assertIsNone(user, 'user id=2 should be deleted.')
 
     def test_find(self):
         rows = db.find('test_user')
         self.assertEqual(len(rows), 2)
-        rows = db.find('test_user', age=18)
+        rows = db.find('test_user', {'age': 18})
         self.assertEqual(len(rows), 2)
+        # 面写对象
+        users = db.find(User, {'id': 1})
+        self.assertEqual(len(users), 1)
+        user = users[0]
+        self.assertEqual(user.id, 1)
+        self.assertEqual(user.name, 'Mario')
+        self.assertEqual(user.age, 18)
 
     def test_find_one(self):
-        row = db.find_one('test_user', id=1)
+        row = db.find_one('test_user', {'id': 1})
         self.assertIsNotNone(row)
         self.assertEqual(row.get('id'), 1)
         self.assertEqual(row.get('name'), 'Mario')
         self.assertEqual(row.get('age'), 18)
+        # 面写对象
+        user = db.find_one(User, {'id': 1})
+        self.assertEqual(user.id, 1)
+        self.assertEqual(user.name, 'Mario')
+        self.assertEqual(user.age, 18)
 
     def test_find_count(self):
-        count = db.find_count('test_user', id=1)
+        count = db.find_count({'id': 1}, table=User)
         self.assertEqual(count, 1)
 
     def test_transactional(self):
@@ -147,3 +175,12 @@ class TestDB(unittest.TestCase):
         row = db.execute_fetchone("select * from test_user where id = 3")
         self.assertIsNotNone(row, 'row is not None in same transactional.')
         raise Exception()
+
+
+class User:
+    TABLE_NAME = 'test_user'
+
+    def __init__(self, **kwargs):
+        self.id = kwargs.get('id')
+        self.name = kwargs.get('name')
+        self.age = kwargs.get('age')

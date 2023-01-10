@@ -18,12 +18,12 @@ db.execute_batch(sql)
 db.execute_script(sql)
 
 # crud
-db.insert('user', dict)
-db.update('user', dict)
-db.delete('user', id=1)
-db.find('user', type=0)
-db.find_one('user', id=1)
-db.find_count('user', type=0)
+db.insert(user)
+db.update(user)
+db.delete(User, {'id': 1})
+db.find(User, {'status': 1})
+db.find_one(User, {'id': 1})
+db.find_count(User, {'status': 1})
 
 # transactions
 with db.transaction():
